@@ -11,6 +11,7 @@ import (
 
 type Raft interface {
 	Propose(prop []byte) error
+	ChangeConf(op string, id uint64, url string) error // 追加
 	Commit() <-chan string
 	DoneReplayWAL() <-chan struct{}
 }
@@ -52,6 +53,10 @@ func (s *Store) Save(key string, value string) error {
 		return err
 	}
 	return nil
+}
+
+func (s *Store) Conf(op string, id uint64, url string) error {
+	return s.ChangeConf(op, id, url)
 }
 
 func (s *Store) RunCommitReader(ctx context.Context) error {

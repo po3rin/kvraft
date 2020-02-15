@@ -48,7 +48,7 @@ func New(id int, peers []string) *RaftAlg {
 	}
 }
 
-func (r *RaftAlg) Run(ctx context.Context) error {
+func (r *RaftAlg) Run(ctx context.Context, join bool) error {
 	c := &raft.Config{
 		ID:              uint64(r.id),
 		ElectionTick:    10,
@@ -81,6 +81,8 @@ func (r *RaftAlg) Run(ctx context.Context) error {
 	r.wal = w
 
 	if oldwal {
+		r.node = raft.RestartNode(c)
+	} else if join { // joinフラグが有効だった場合
 		r.node = raft.RestartNode(c)
 	} else {
 		r.node = raft.StartNode(c, rpeers)
@@ -131,6 +133,29 @@ func (r *RaftAlg) Propose(prop []byte) error {
 	)
 	defer cancel()
 	return r.node.Propose(ctx, prop)
+}
+
+func (r *RaftAlg) ChangeConf(op string, nodeID uint64, url string) error {
+	var t raftpb.ConfChangeType
+	switch op {
+	case "add":
+		t = raftpb.ConfChangeAddNode
+	case "remove":
+		t = raftpb.ConfChangeRemoveNode
+	default:
+		return fmt.Errorf("unsupported operation %v", op)
+	}
+
+	cc := raftpb.ConfChange{
+		Type:    t,
+		NodeID:  nodeID,
+		Context: []byte(url),
+	}
+	ctx, cancel := context.WithTimeout(
+		context.Background(), 5*time.Second,
+	)
+	defer cancel()
+	return r.node.ProposeConfChange(ctx, cc)
 }
 
 func (r *RaftAlg) Commit() <-chan string {
@@ -190,23 +215,49 @@ func (r *RaftAlg) publishEntries(
 	ctx context.Context, ents []raftpb.Entry,
 ) error {
 	for i := range ents {
-		if ents[i].Type != raftpb.EntryNormal ||
-			len(ents[i].Data) == 0 {
-			// EntryNormal 型のエントリのみをサポートする
-			// 他のタイプについては後述
-			continue
-		}
-		s := string(ents[i].Data)
+		switch ents[i].Type {
+		case raftpb.EntryNormal:
+			if len(ents[i].Data) == 0 {
+				continue
+			}
+			s := string(ents[i].Data)
 
-		select {
-		// 適用して良いエントリをチャネル経由で通知する
-		case r.commitC <- s:
-		case <-time.After(10 * time.Second):
-			return errors.New(
-				"timeout(10s) sending committed channel",
-			)
-		case <-ctx.Done():
-			return ctx.Err()
+			select {
+			// 適用して良いエントリをチャネル経由で通知する
+			case r.commitC <- s:
+			case <-time.After(10 * time.Second):
+				return errors.New(
+					"timeout(10s) sending committed channel",
+				)
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+
+		// 先ほどスルーしていたaftpb.EntryConfChange型の処理
+		case raftpb.EntryConfChange:
+			var cc raftpb.ConfChange
+			if err := cc.Unmarshal(ents[i].Data); err != nil {
+				return err
+			}
+
+			r.node.ApplyConfChange(cc)
+			switch cc.Type {
+			case raftpb.ConfChangeAddNode:
+				if len(cc.Context) > 0 {
+					r.transport.AddPeer(
+						types.ID(cc.NodeID),
+						[]string{string(cc.Context)},
+					)
+				}
+			case raftpb.ConfChangeRemoveNode:
+				if cc.NodeID == uint64(r.id) {
+					// 終了するノードが自分ならエラー返す
+					return errors.New(
+						"cluster removes this node",
+					)
+				}
+				r.transport.RemovePeer(types.ID(cc.NodeID))
+			}
 		}
 	}
 	return nil

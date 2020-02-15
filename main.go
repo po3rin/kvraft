@@ -21,6 +21,7 @@ func main() {
 		"cluster", "http://127.0.0.1:9021", "comma separated cluster peers",
 	)
 	id := flag.Int("id", 1, "node ID")
+	join := flag.Bool("join", false, "join an existing cluster")
 	flag.Parse()
 
 	ra := raftalg.New(*id, strings.Split(*cluster, ","))
@@ -32,7 +33,7 @@ func main() {
 
 	eg, ctx := errgroup.WithContext(ctx)
 	eg.Go(func() error {
-		return ra.Run(ctx)
+		return ra.Run(ctx, *join)
 	})
 	eg.Go(func() error {
 		return s.RunCommitReader(ctx)
